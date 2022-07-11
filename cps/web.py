@@ -1406,16 +1406,32 @@ def login_post():
                 log.warning('Username missing for password reset IP-address: %s', ip_address)
         else:
             if user and check_password_hash(str(user.password), form['password']) and user.name != "Guest":
+                login_user(user, remember=bool(form.get('remember_me')))
+                ub.store_user_session()
+                log.debug(u"You are now logged in as: '%s'", user.name)
+                flash(_(u"You are now logged in as: '%(nickname)s'", nickname=user.name), category="success")
                 config.config_is_initial = False
-                log.debug(u"You are now logged in as: '{}'".format(user.name))
-                return handle_login_user(user,
-                                         remember_me,
-                                         _(u"You are now logged in as: '%(nickname)s'", nickname=user.name),
-                                         "success")
+                return redirect_back(url_for("web.index"))
             else:
                 log.warning('Login failed for user "{}" IP-address: {}'.format(form['username'], ip_address))
                 flash(_(u"Wrong Username or Password"), category="error")
-    return render_login(form.get("username", ""), form.get("password", ""))
+
+    next_url = request.args.get('next', default=url_for("web.index"), type=str)
+    if url_for("web.logout") == next_url:
+        next_url = url_for("web.index")
+
+    login_button = "generic oauth2 provider"
+    if 3 in oauth_check:
+        from .oauth_bb import oauthblueprints
+        login_button = oauthblueprints[2].get('login_button') or login_button
+
+    return render_title_template('login.html',
+                                 title=_(u"Login"),
+                                 next_url=next_url,
+                                 config=config,
+                                 oauth_check=oauth_check,
+                                 login_button=login_button,
+                                 mail=config.get_mail_server_configured(), page="login")
 
 
 @web.route('/logout')
