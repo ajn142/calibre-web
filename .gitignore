@@ -35,3 +35,8 @@ gdrive_credentials
 client_secrets.json
 gmail.json
 /.key
+
+#artifacts from merged repo
+.gitlab-ci.yml
+Dockerfile
+root/
