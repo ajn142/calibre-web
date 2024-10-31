@@ -29,7 +29,7 @@ from flask import request, redirect, send_from_directory, make_response, flash, 
 from flask import session as flask_session
 from flask_babel import gettext as _
 from flask_babel import get_locale
-from flask_login import login_user, logout_user, login_required, current_user
+from .cw_login import login_user, logout_user, current_user
 from flask_limiter import RateLimitExceeded
 from flask_limiter.util import get_remote_address
 from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
@@ -50,7 +50,7 @@ from .helper import check_valid_domain, check_email, check_username, \
     send_registration_mail, check_send_to_ereader, check_read_formats, tags_filters, reset_password, valid_email, \
     edit_book_read_status, valid_password
 from .pagination import Pagination
-from .redirect import redirect_back
+from .redirect import get_redirect_location
 from .babel import get_available_locale
 from .usermanagement import login_required_if_no_ano
 from .kobo_sync_status import remove_synced_book
@@ -59,6 +59,8 @@ from .kobo_sync_status import change_archived_books
 from . import limiter
 from .services.worker import WorkerThread
 from .tasks_status import render_task_status
+from .usermanagement import user_login_required
+from .string_helper import strip_whitespaces
 
 
 feature_support = {
@@ -86,24 +88,28 @@ except ImportError:
 
 @app.after_request
 def add_security_headers(resp):
-    csp = "default-src 'self'"
-    csp += ''.join([' ' + host for host in config.config_trustedhosts.strip().split(',')])
-    csp += " 'unsafe-inline' 'unsafe-eval'; font-src 'self' data:; img-src 'self'"
+    default_src = ([host.strip() for host in config.config_trustedhosts.split(',') if host] +
+                   ["'self'", "'unsafe-inline'", "'unsafe-eval'"])
+    csp = "default-src " + ' '.join(default_src)
+    if request.endpoint == "web.read_book" and config.config_use_google_drive:
+        csp +=" blob: "
+    csp += "; font-src 'self' data:"
+    if request.endpoint == "web.read_book":
+        csp += " blob: "
+    csp += "; img-src 'self'"
     if request.path.startswith("/author/") and config.config_use_goodreads:
         csp += " images.gr-assets.com i.gr-assets.com s.gr-assets.com"
     csp += " data:"
     if request.endpoint == "edit-book.show_edit_book" or config.config_use_google_drive:
-        csp += " *;"
-    elif request.endpoint == "web.read_book":
-        csp += " blob:; style-src-elem 'self' blob: 'unsafe-inline';"
-    else:
-        csp += ";"
-    csp += " object-src 'none';"
+        csp += " *"
+    if request.endpoint == "web.read_book":
+        csp += " blob: ; style-src-elem 'self' blob: 'unsafe-inline'"
+    csp += "; object-src 'none';"
     resp.headers['Content-Security-Policy'] = csp
     resp.headers['X-Content-Type-Options'] = 'nosniff'
     resp.headers['X-Frame-Options'] = 'SAMEORIGIN'
     resp.headers['X-XSS-Protection'] = '1; mode=block'
-    resp.headers['Strict-Transport-Security'] = 'max-age=31536000;'
+    resp.headers['Strict-Transport-Security'] = 'max-age=31536000';
     return resp
 
 
@@ -139,14 +145,14 @@ def viewer_required(f):
 
 
 @web.route("/ajax/emailstat")
-@login_required
+@user_login_required
 def get_email_status_json():
     tasks = WorkerThread.get_instance().tasks
     return jsonify(render_task_status(tasks))
 
 
 @web.route("/ajax/bookmark/<int:book_id>/<book_format>", methods=['POST'])
-@login_required
+@user_login_required
 def set_bookmark(book_id, book_format):
     bookmark_key = request.form["bookmark"]
     ub.session.query(ub.Bookmark).filter(and_(ub.Bookmark.user_id == int(current_user.id),
@@ -166,7 +172,7 @@ def set_bookmark(book_id, book_format):
 
 
 @web.route("/ajax/toggleread/<int:book_id>", methods=['POST'])
-@login_required
+@user_login_required
 def toggle_read(book_id):
     message = edit_book_read_status(book_id)
     if message:
@@ -176,11 +182,11 @@ def toggle_read(book_id):
 
 
 @web.route("/ajax/togglearchived/<int:book_id>", methods=['POST'])
-@login_required
+@user_login_required
 def toggle_archived(book_id):
-    is_archived = change_archived_books(book_id, message="Book {} archive bit toggled".format(book_id))
-    if is_archived:
-        remove_synced_book(book_id)
+    change_archived_books(book_id, message="Book {} archive bit toggled".format(book_id))
+    # Remove book from syncd books list to force resync (?)
+    remove_synced_book(book_id)
     return ""
 
 
@@ -200,7 +206,7 @@ def update_view():
 
 '''
 @web.route("/ajax/getcomic/<int:book_id>/<book_format>/<int:page>")
-@login_required
+@user_login_required
 def get_comic_book(book_id, book_format, page):
     book = calibre_db.get_book(book_id)
     if not book:
@@ -293,9 +299,10 @@ def get_languages_json():
 def get_matching_tags():
     tag_dict = {'tags': []}
     q = calibre_db.session.query(db.Books).filter(calibre_db.common_filters(True))
-    calibre_db.session.connection().connection.connection.create_function("lower", 1, db.lcase)
-    author_input = request.args.get('author_name') or ''
-    title_input = request.args.get('book_title') or ''
+    calibre_db.create_functions()
+    # calibre_db.session.connection().connection.connection.create_function("lower", 1, db.lcase)
+    author_input = request.args.get('authors') or ''
+    title_input = request.args.get('title') or ''
     include_tag_inputs = request.args.getlist('include_tag') or ''
     exclude_tag_inputs = request.args.getlist('exclude_tag') or ''
     q = q.filter(db.Books.authors.any(func.lower(db.Authors.name).ilike("%" + author_input + "%")),
@@ -613,10 +620,9 @@ def render_ratings_books(page, book_id, order):
                                                                 db_filter,
                                                                 [order[0][0]],
                                                                 True, config.config_read_column,
-                                                                db.books_series_link,
-                                                                db.Books.id == db.books_series_link.c.book,
-                                                                db.Series,
-                                                                db.books_ratings_link, db.Ratings)
+                                                                db.books_ratings_link,
+                                                                db.Books.id == db.books_ratings_link.c.book,
+                                                                db.Ratings)
         title = _("Rating: None")
     else:
         name = calibre_db.session.query(db.Ratings).filter(db.Ratings.id == book_id).first()
@@ -634,19 +640,32 @@ def render_ratings_books(page, book_id, order):
 
 
 def render_formats_books(page, book_id, order):
-    name = calibre_db.session.query(db.Data).filter(db.Data.format == book_id.upper()).first()
-    if name:
+    if book_id == '-1':
+        name = _("None")
         entries, random, pagination = calibre_db.fill_indexpage(page, 0,
                                                                 db.Books,
-                                                                db.Books.data.any(db.Data.format == book_id.upper()),
+                                                                db.Data.format == None,
                                                                 [order[0][0]],
-                                                                True, config.config_read_column)
-        return render_title_template('index.html', random=random, pagination=pagination, entries=entries, id=book_id,
-                                     title=_("File format: %(format)s", format=name.format),
-                                     page="formats",
-                                     order=order[1])
+                                                                True, config.config_read_column,
+                                                                db.Data)
+
     else:
-        abort(404)
+        name = calibre_db.session.query(db.Data).filter(db.Data.format == book_id.upper()).first()
+        if name:
+            name = name.format
+            entries, random, pagination = calibre_db.fill_indexpage(page, 0,
+                                                                    db.Books,
+                                                                    db.Books.data.any(
+                                                                        db.Data.format == book_id.upper()),
+                                                                    [order[0][0]],
+                                                                    True, config.config_read_column)
+        else:
+            abort(404)
+
+    return render_title_template('index.html', random=random, pagination=pagination, entries=entries, id=book_id,
+                                 title=_("File format: %(format)s", format=name),
+                                 page="formats",
+                                 order=order[1])
 
 
 def render_category_books(page, book_id, order):
@@ -800,7 +819,7 @@ def books_list(data, sort_param, book_id, page):
 
 
 @web.route("/table")
-@login_required
+@user_login_required
 def books_table():
     visibility = current_user.view_settings.get('table', {})
     cc = calibre_db.get_cc_columns(config, filter_config_custom_read=True)
@@ -809,7 +828,7 @@ def books_table():
 
 
 @web.route("/ajax/listbooks")
-@login_required
+@user_login_required
 def list_books():
     off = int(request.args.get("offset") or 0)
     limit = int(request.args.get("limit") or config.config_books_per_page)
@@ -890,7 +909,7 @@ def list_books():
 
 
 @web.route("/ajax/table_settings", methods=['POST'])
-@login_required
+@user_login_required
 def update_table_settings():
     current_user.view_settings['table'] = json.loads(request.data)
     try:
@@ -1057,7 +1076,7 @@ def ratings_list():
 @login_required_if_no_ano
 def formats_list():
     if current_user.check_visibility(constants.SIDEBAR_FORMAT):
-        if current_user.get_view_property('ratings', 'dir') == 'desc':
+        if current_user.get_view_property('formats', 'dir') == 'desc':
             order = db.Data.format.desc()
             order_no = 0
         else:
@@ -1192,7 +1211,7 @@ def serve_book(book_id, book_format, anyname):
         if book_format.upper() == 'TXT':
             log.info('Serving book: %s', data.name)
             try:
-                rawdata = open(os.path.join(config.config_calibre_dir, book.path, data.name + "." + book_format),
+                rawdata = open(os.path.join(config.get_book_path(), book.path, data.name + "." + book_format),
                                "rb").read()
                 result = chardet.detect(rawdata)
                 try:
@@ -1209,7 +1228,7 @@ def serve_book(book_id, book_format, anyname):
                 return "File Not Found"
         # enable byte range read of pdf
         response = make_response(
-            send_from_directory(os.path.join(config.config_calibre_dir, book.path), data.name + "." + book_format))
+            send_from_directory(os.path.join(config.get_book_path(), book.path), data.name + "." + book_format))
         if not range_header:
             log.info('Serving book: %s', data.name)
             response.headers['Accept-Ranges'] = 'bytes'
@@ -1233,7 +1252,7 @@ def send_to_ereader(book_id, book_format, convert):
         response = [{'type': "danger", 'message': _("Please configure the SMTP mail settings first...")}]
         return Response(json.dumps(response), mimetype='application/json')
     elif current_user.kindle_mail:
-        result = send_mail(book_id, book_format, convert, current_user.kindle_mail, config.config_calibre_dir,
+        result = send_mail(book_id, book_format, convert, current_user.kindle_mail, config.get_book_path(),
                            current_user.name)
         if result is None:
             ub.update_download(book_id, int(current_user.id))
@@ -1260,12 +1279,16 @@ def register_post():
     except RateLimitExceeded:
         flash(_(u"Please wait one minute to register next user"), category="error")
         return render_title_template('register.html', config=config, title=_("Register"), page="register")
+    except (ConnectionError, Exception) as e:
+        log.error("Connection error to limiter backend: %s", e)
+        flash(_("Connection error to limiter backend, please contact your administrator"), category="error")
+        return render_title_template('register.html', config=config, title=_("Register"), page="register")
     if current_user is not None and current_user.is_authenticated:
         return redirect(url_for('web.index'))
     if not config.get_mail_server_configured():
         flash(_("Oops! Email server is not configured, please contact your administrator."), category="error")
         return render_title_template('register.html', title=_("Register"), page="register")
-    nickname = to_save.get("email", "").strip() if config.config_register_email else to_save.get('name')
+    nickname = strip_whitespaces(to_save.get("email", "")) if config.config_register_email else to_save.get('name')
     if not nickname or not to_save.get("email"):
         flash(_("Oops! Please complete all fields."), category="error")
         return render_title_template('register.html', title=_("Register"), page="register")
@@ -1290,7 +1313,7 @@ def register_post():
             ub.session.commit()
             if feature_support['oauth']:
                 register_user_with_oauth(content)
-            send_registration_mail(to_save.get("email", "").strip(), nickname, password)
+            send_registration_mail(strip_whitespaces(to_save.get("email", "")), nickname, password)
         except Exception:
             ub.session.rollback()
             flash(_("Oops! An unknown error occurred. Please try again later."), category="error")
@@ -1319,10 +1342,9 @@ def register():
 
 def handle_login_user(user, remember, message, category):
     login_user(user, remember=remember)
-    ub.store_user_session()
     flash(message, category=category)
     [limiter.limiter.storage.clear(k.key) for k in limiter.current_limits]
-    return redirect_back(url_for("web.index"))
+    return redirect(get_redirect_location(request.form.get('next', None), "web.index"))
 
 
 def render_login(username="", password=""):
@@ -1350,25 +1372,29 @@ def login():
 
 
 @web.route('/login', methods=['POST'])
-@limiter.limit("40/day", key_func=lambda: request.form.get('username', "").strip().lower())
-@limiter.limit("3/minute", key_func=lambda: request.form.get('username', "").strip().lower())
+@limiter.limit("40/day", key_func=lambda: strip_whitespaces(request.form.get('username', "")).lower())
+@limiter.limit("3/minute", key_func=lambda: strip_whitespaces(request.form.get('username', "")).lower())
 def login_post():
     form = request.form.to_dict()
+    username = strip_whitespaces(form.get('username', "")).lower().replace("\n","").replace("\r","")
     try:
         limiter.check()
     except RateLimitExceeded:
-        flash(_(u"Please wait one minute before next login"), category="error")
-        return render_login(form.get("username", ""), form.get("password", ""))
+        flash(_("Please wait one minute before next login"), category="error")
+        return render_login(username, form.get("password", ""))
+    except (ConnectionError, Exception) as e:
+        log.error("Connection error to limiter backend: %s", e)
+        flash(_("Connection error to limiter backend, please contact your administrator"), category="error")
+        return render_login(username, form.get("password", ""))
     if current_user is not None and current_user.is_authenticated:
         return redirect(url_for('web.index'))
     if config.config_login_type == constants.LOGIN_LDAP and not services.ldap:
         log.error(u"Cannot activate LDAP authentication")
         flash(_(u"Cannot activate LDAP authentication"), category="error")
-    user = ub.session.query(ub.User).filter(func.lower(ub.User.name) == form.get('username', "").strip().lower()) \
-        .first()
+    user = ub.session.query(ub.User).filter(func.lower(ub.User.name) == username).first()
     remember_me = bool(form.get('remember_me'))
     if config.config_login_type == constants.LOGIN_LDAP and services.ldap and user and form['password'] != "":
-        login_result, error = services.ldap.bind_user(form['username'], form['password'])
+        login_result, error = services.ldap.bind_user(username, form['password'])
         if login_result:
             log.debug(u"You are now logged in as: '{}'".format(user.name))
             return handle_login_user(user,
@@ -1388,7 +1414,7 @@ def login_post():
             flash(_(u"Could not login: %(message)s", message=error), category="error")
         else:
             ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-            log.warning('LDAP Login failed for user "%s" IP-address: %s', form['username'], ip_address)
+            log.warning('LDAP Login failed for user "%s" IP-address: %s', username, ip_address)
             flash(_(u"Wrong Username or Password"), category="error")
     else:
         ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -1396,8 +1422,8 @@ def login_post():
             if user is not None and user.name != "Guest":
                 ret, __ = reset_password(user.id)
                 if ret == 1:
-                    flash(_(u"New Password was send to your email address"), category="info")
-                    log.info('Password reset for user "%s" IP-address: %s', form['username'], ip_address)
+                    flash(_(u"New Password was sent to your email address"), category="info")
+                    log.info('Password reset for user "%s" IP-address: %s', username, ip_address)
                 else:
                     log.error(u"An unknown error occurred. Please try again later")
                     flash(_(u"An unknown error occurred. Please try again later."), category="error")
@@ -1413,13 +1439,13 @@ def login_post():
                                          _(u"You are now logged in as: '%(nickname)s'", nickname=user.name),
                                          "success")
             else:
-                log.warning('Login failed for user "{}" IP-address: {}'.format(form['username'], ip_address))
+                log.warning('Login failed for user "{}" IP-address: {}'.format(username, ip_address))
                 flash(_(u"Wrong Username or Password"), category="error")
-    return render_login(form.get("username", ""), form.get("password", ""))
+    return render_login(username, form.get("password", ""))
 
 
 @web.route('/logout')
-@login_required
+@user_login_required
 def logout():
     if current_user is not None and current_user.is_authenticated:
         ub.delete_user_session(current_user.id, flask_session.get('_id', ""))
@@ -1427,7 +1453,14 @@ def logout():
         if feature_support['oauth'] and (config.config_login_type == 2 or config.config_login_type == 3):
             logout_oauth_user()
     log.debug("User logged out")
-    return redirect(url_for('web.login'))
+    if config.config_anonbrowse:
+        location = get_redirect_location(request.args.get('next', None), "web.login")
+    else:
+        location = None
+    if location:
+        return redirect(location)
+    else:
+        return redirect(url_for('web.login'))
 
 
 # ################################### Users own configuration #########################################################
@@ -1497,7 +1530,7 @@ def change_profile(kobo_support, local_oauth_check, oauth_status, translations, 
 
 
 @web.route("/me", methods=["GET", "POST"])
-@login_required
+@user_login_required
 def profile():
     languages = calibre_db.speaking_language()
     translations = get_available_locale()
@@ -1558,7 +1591,8 @@ def read_book(book_id, book_format):
         return render_title_template('readtxt.html', txtfile=book_id, title=book.title)
     elif book_format.lower() in ["djvu", "djv"]:
         log.debug("Start djvu reader for %d", book_id)
-        return render_title_template('readdjvu.html', djvufile=book_id, title=book.title, extension=book_format.lower())
+        return render_title_template('readdjvu.html', djvufile=book_id, title=book.title,
+                                     extension=book_format.lower())
     else:
         for fileExt in constants.EXTENSIONS_AUDIO:
             if book_format.lower() == fileExt:

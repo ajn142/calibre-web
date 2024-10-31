@@ -56,23 +56,29 @@ except ImportError:
 mimetypes.init()
 mimetypes.add_type('application/xhtml+xml', '.xhtml')
 mimetypes.add_type('application/epub+zip', '.epub')
-mimetypes.add_type('application/fb2+zip', '.fb2')
-mimetypes.add_type('application/x-mobipocket-ebook', '.mobi')
-mimetypes.add_type('application/x-mobipocket-ebook', '.prc')
+mimetypes.add_type('application/epub+zip', '.kepub')
+mimetypes.add_type('text/xml', '.fb2')
+mimetypes.add_type('application/octet-stream', '.mobi')
+mimetypes.add_type('application/octet-stream', '.prc')
 mimetypes.add_type('application/vnd.amazon.ebook', '.azw')
 mimetypes.add_type('application/x-mobi8-ebook', '.azw3')
-mimetypes.add_type('application/x-cbr', '.cbr')
-mimetypes.add_type('application/x-cbz', '.cbz')
-mimetypes.add_type('application/x-cbt', '.cbt')
-mimetypes.add_type('application/x-cb7', '.cb7')
+mimetypes.add_type('application/x-rar', '.cbr')
+mimetypes.add_type('application/zip', '.cbz')
+mimetypes.add_type('application/x-tar', '.cbt')
+mimetypes.add_type('application/x-7z-compressed', '.cb7')
 mimetypes.add_type('image/vnd.djv', '.djv')
+mimetypes.add_type('image/vnd.djv', '.djvu')
 mimetypes.add_type('application/mpeg', '.mpeg')
-mimetypes.add_type('application/mpeg', '.mp3')
-mimetypes.add_type('application/mp4', '.m4a')
-mimetypes.add_type('application/mp4', '.m4b')
-mimetypes.add_type('application/ogg', '.ogg')
+mimetypes.add_type('audio/mpeg', '.mp3')
+mimetypes.add_type('audio/x-m4a', '.m4a')
+mimetypes.add_type('audio/x-m4a', '.m4b')
+mimetypes.add_type('audio/x-hx-aac-adts', '.aac')
+mimetypes.add_type('audio/vnd.dolby.dd-raw', '.ac3')
+mimetypes.add_type('video/x-ms-asf', '.asf')
+mimetypes.add_type('audio/ogg', '.ogg')
 mimetypes.add_type('application/ogg', '.oga')
 mimetypes.add_type('text/css', '.css')
+mimetypes.add_type('application/x-ms-reader', '.lit')
 mimetypes.add_type('text/javascript; charset=UTF-8', '.js')
 
 log = logger.create()
@@ -81,8 +87,10 @@ app = Flask(__name__)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
-    REMEMBER_COOKIE_SAMESITE='Lax',  # will be available in flask-login 0.5.1 earliest
-    WTF_CSRF_SSL_STRICT=False
+    REMEMBER_COOKIE_SAMESITE='Strict',
+    WTF_CSRF_SSL_STRICT=False,
+    SESSION_COOKIE_NAME=os.environ.get('COOKIE_PREFIX', "") + "session",
+    REMEMBER_COOKIE_NAME=os.environ.get('COOKIE_PREFIX', "") + "remember_token"
 )
 
 lm = MyLoginManager()
@@ -103,9 +111,10 @@ web_server = WebServer()
 updater_thread = Updater()
 
 if limiter_present:
-    limiter = Limiter(key_func=True, headers_enabled=True, auto_check=False, swallow_errors=True)
+    limiter = Limiter(key_func=True, headers_enabled=True, auto_check=False, swallow_errors=False)
 else:
     limiter = None
+
 
 def create_app():
     if csrf:
@@ -125,13 +134,6 @@ def create_app():
 
     ub.password_change(cli_param.user_credentials)
 
-    if not limiter:
-        log.info('*** "flask-limiter" is needed for calibre-web to run. '
-                 'Please install it using pip: "pip install flask-limiter" ***')
-        print('*** "flask-limiter" is needed for calibre-web to run. '
-              'Please install it using pip: "pip install flask-limiter" ***')
-        web_server.stop(True)
-        sys.exit(8)
     if sys.version_info < (3, 0):
         log.info(
             '*** Python2 is EOL since end of 2019, this version of Calibre-Web is no longer supporting Python2, '
@@ -141,13 +143,6 @@ def create_app():
             'please update your installation to Python3 ***')
         web_server.stop(True)
         sys.exit(5)
-    if not wtf_present:
-        log.info('*** "flask-WTF" is needed for calibre-web to run. '
-                 'Please install it using pip: "pip install flask-WTF" ***')
-        print('*** "flask-WTF" is needed for calibre-web to run. '
-              'Please install it using pip: "pip install flask-WTF" ***')
-        web_server.stop(True)
-        sys.exit(7)
 
     lm.login_view = 'web.login'
     lm.anonymous_user = ub.Anonymous
@@ -158,13 +153,21 @@ def create_app():
     calibre_db.init_db()
 
     updater_thread.init_updater(config, web_server)
-    # Perform dry run of updater and exit afterwards
+    # Perform dry run of updater and exit afterward
     if cli_param.dry_run:
         updater_thread.dry_run()
         sys.exit(0)
     updater_thread.start()
-
-    for res in dependency_check() + dependency_check(True):
+    requirements = dependency_check()
+    for res in requirements:
+        if res['found'] == "not installed":
+            message = ('Cannot import {name} module, it is needed to run calibre-web, '
+                       'please install it using "pip install {name}"').format(name=res["name"])
+            log.info(message)
+            print("*** " + message + " ***")
+            web_server.stop(True)
+            sys.exit(8)
+    for res in requirements + dependency_check(True):
         log.info('*** "{}" version does not meet the requirements. '
                  'Should: {}, Found: {}, please consider installing required version ***'
                  .format(res['name'],
@@ -192,12 +195,21 @@ def create_app():
         services.ldap.init_app(app, config)
     if services.goodreads_support:
         services.goodreads_support.connect(config.config_goodreads_api_key,
-                                           config.config_goodreads_api_secret_e,
                                            config.config_use_goodreads)
     config.store_calibre_uuid(calibre_db, db.Library_Id)
     # Configure rate limiter
+    # https://limits.readthedocs.io/en/stable/storage.html
     app.config.update(RATELIMIT_ENABLED=config.config_ratelimiter)
-    limiter.init_app(app)
+    if config.config_limiter_uri != "" and not cli_param.memory_backend:
+        app.config.update(RATELIMIT_STORAGE_URI=config.config_limiter_uri)
+        if config.config_limiter_options != "":
+            app.config.update(RATELIMIT_STORAGE_OPTIONS=config.config_limiter_options)
+    try:
+        limiter.init_app(app)
+    except Exception as e:
+        log.error('Wrong Flask Limiter configuration, falling back to default: {}'.format(e))
+        app.config.update(RATELIMIT_STORAGE_URI=None)
+        limiter.init_app(app)
 
     # Register scheduled tasks
     from .schedule import register_scheduled_tasks, register_startup_tasks
